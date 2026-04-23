@@ -27,6 +27,12 @@ from datasets import load_dataset
 from jiwer import wer as compute_wer
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
+try:
+    from peft import LoraConfig, get_peft_model
+    _PEFT_AVAILABLE = True
+except ImportError:
+    _PEFT_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -36,7 +42,7 @@ MODEL_ID   = "openai/whisper-large-v3-turbo"
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-LAYERS_TO_REMOVE = [5, 6, 7, 9, 10, 11]  # 6 least important by mean ΔWER
+LAYERS_TO_REMOVE = [5, 6, 7, 9, 10, 11]  # default: 6 least important by mean ΔWER
 
 LANGUAGES = {
     "da_dk": "danish",
@@ -71,7 +77,7 @@ def transcribe_dataset(model, processor, dataset, lang_name: str):
         batch = audios[start : start + EVAL_BATCH_SIZE]
         inputs = processor(
             batch, sampling_rate=sr, return_tensors="pt", padding="max_length",
-        ).to(device=DEVICE, dtype=model.dtype)
+        ).to(device=DEVICE, dtype=torch.bfloat16)
         with torch.no_grad():
             ids = model.generate(inputs.input_features, language=lang_name, task="transcribe")
         hypotheses.extend(h.lower().strip() for h in processor.batch_decode(ids, skip_special_tokens=True))
@@ -105,6 +111,11 @@ def parse_args():
     p.add_argument("--batch-size", type=int,   default=8,     help="Distillation batch size (default: 8)")
     p.add_argument("--eval-every", type=int,   default=500,   help="Evaluate on FLEURS every N steps (default: 500)")
     p.add_argument("--seed",       type=int,   default=42)
+    p.add_argument("--device",     type=str,   default=None,  help="Device (e.g. cuda:1). Defaults to cuda if available.")
+    p.add_argument("--layers",     type=int,   nargs="+",     default=None,
+                   help="Encoder layer indices to remove (default: 5 6 7 9 10 11)")
+    p.add_argument("--lora",       type=int,   default=None,  metavar="RANK",
+                   help="Use LoRA with given rank instead of full fine-tuning (e.g. --lora 16)")
     return p.parse_args()
 
 
@@ -113,29 +124,61 @@ def main():
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
+    global DEVICE
+    if args.device:
+        DEVICE = args.device
+
+    layers_to_remove = sorted(args.layers) if args.layers is not None else LAYERS_TO_REMOVE
+    tag = "_".join(str(l) for l in layers_to_remove)
+    if args.lora:
+        tag += f"_lora{args.lora}"
+    log_path    = RESULTS_DIR / f"distillation_log_{tag}.json"
+    output_dir  = RESULTS_DIR / f"distilled_pruned_model_{tag}"
+
     print(f"Device: {DEVICE}")
-    print(f"Layers to remove: {LAYERS_TO_REMOVE}")
+    print(f"Layers to remove: {layers_to_remove}")
+    print(f"LoRA rank: {args.lora if args.lora else 'disabled (full fine-tuning)'}")
     print(f"Steps: {args.steps}  LR: {args.lr}  Batch: {args.batch_size}\n")
 
     # --- load models ---
     print("Loading processor and models...")
     processor = AutoProcessor.from_pretrained(MODEL_ID)
 
-    teacher = AutoModelForSpeechSeq2Seq.from_pretrained(MODEL_ID, dtype=torch.float16)
-    teacher = teacher.to(DEVICE).eval()
+    teacher = AutoModelForSpeechSeq2Seq.from_pretrained(MODEL_ID, dtype=torch.bfloat16)
     for p in teacher.parameters():
         p.requires_grad_(False)
 
-    student = prune_encoder_layers(teacher, LAYERS_TO_REMOVE)
-    student = student.to(DEVICE)
-    for p in student.model.encoder.parameters():
-        p.requires_grad_(True)
-    for p in student.model.decoder.parameters():
-        p.requires_grad_(False)
-    student.train()
+    # Prune on CPU before moving to GPU to avoid needing two full model copies in VRAM
+    student = prune_encoder_layers(teacher, layers_to_remove)
 
-    n_params = sum(p.numel() for p in student.model.encoder.parameters())
-    print(f"Student encoder parameters: {n_params / 1e6:.1f}M")
+    teacher = teacher.to(DEVICE).eval()
+    student = student.to(DEVICE)
+
+    if args.lora:
+        if not _PEFT_AVAILABLE:
+            raise ImportError("peft is required for --lora. Run: uv add peft")
+        for p in student.parameters():
+            p.requires_grad_(False)
+        lora_cfg = LoraConfig(
+            r=args.lora,
+            lora_alpha=args.lora * 2,
+            target_modules=["q_proj", "v_proj"],
+            layers_to_transform=list(range(len(student.model.encoder.layers))),
+        )
+        student = get_peft_model(student, lora_cfg)
+        encoder_fn = lambda x: student.base_model.model.model.encoder(x).last_hidden_state
+        trainable_params = [p for p in student.parameters() if p.requires_grad]
+    else:
+        for p in student.model.encoder.parameters():
+            p.requires_grad_(True)
+        for p in student.model.decoder.parameters():
+            p.requires_grad_(False)
+        encoder_fn = lambda x: student.model.encoder(x).last_hidden_state
+        trainable_params = list(student.model.encoder.parameters())
+
+    student.train()
+    n_params = sum(p.numel() for p in trainable_params)
+    print(f"Trainable encoder parameters: {n_params / 1e6:.2f}M")
 
     # --- load FLEURS for evaluation ---
     print("\nLoading FLEURS test sets...")
@@ -146,10 +189,21 @@ def main():
     with open(RESULTS_DIR / "baseline_wers.json") as f:
         baseline_wers = json.load(f)
 
-    # --- zero-shot baseline ---
-    student.eval()
-    zero_shot = evaluate_wer(student, processor, fleurs, baseline_wers, "zero-shot pruned (before distillation)")
-    student.train()
+    # --- zero-shot baseline (skip if already saved) ---
+    if log_path.exists():
+        with open(log_path) as f:
+            existing = json.load(f)
+        if "zero_shot" in existing:
+            print("\nLoading cached zero-shot baseline from distillation_log.json")
+            zero_shot = existing["zero_shot"]
+        else:
+            student.eval()
+            zero_shot = evaluate_wer(student, processor, fleurs, baseline_wers, "zero-shot pruned (before distillation)")
+            student.train()
+    else:
+        student.eval()
+        zero_shot = evaluate_wer(student, processor, fleurs, baseline_wers, "zero-shot pruned (before distillation)")
+        student.train()
 
     # --- load distillation data ---
     print("\nLoading People's Speech (distillation corpus)...")
@@ -161,7 +215,7 @@ def main():
 
     # --- optimizer ---
     optimizer = torch.optim.AdamW(
-        student.model.encoder.parameters(),
+        trainable_params,
         lr=args.lr,
         weight_decay=0.01,
     )
@@ -188,16 +242,21 @@ def main():
             sampling_rate=sr,
             return_tensors="pt",
             padding="max_length",
-        ).to(device=DEVICE, dtype=torch.float16)
+        ).to(device=DEVICE, dtype=torch.bfloat16)
 
         with torch.no_grad():
             teacher_out = teacher.model.encoder(inputs.input_features).last_hidden_state
 
-        student_out = student.model.encoder(inputs.input_features).last_hidden_state
+        student_out = encoder_fn(inputs.input_features)
 
         loss = F.mse_loss(student_out.float(), teacher_out.float())
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite loss ({loss.item()}) at step {step + 1}. "
+                               "Check for activation overflow — try a lower learning rate or bfloat16.")
+
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(student.model.encoder.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer.step()
         optimizer.zero_grad()
 
@@ -221,21 +280,21 @@ def main():
                 best_state    = copy.deepcopy(student.state_dict())
                 print(f"  → new best (mean rel_Δ={mean_rel:+.3f}), saving checkpoint")
 
-            with open(RESULTS_DIR / "distillation_log.json", "w") as f:
+            with open(log_path, "w") as f:
                 json.dump(results_log, f, indent=2)
 
     # --- save best model ---
     print("\nSaving best checkpoint...")
     student.load_state_dict(best_state)
-    student.save_pretrained(RESULTS_DIR / "distilled_pruned_model")
-    processor.save_pretrained(RESULTS_DIR / "distilled_pruned_model")
-    print(f"Saved → {RESULTS_DIR / 'distilled_pruned_model'}")
+    student.save_pretrained(output_dir)
+    processor.save_pretrained(output_dir)
+    print(f"Saved → {output_dir}")
 
     # --- final evaluation ---
     student.eval()
     final = evaluate_wer(student, processor, fleurs, baseline_wers, "final (best checkpoint)")
     results_log["final"] = final
-    with open(RESULTS_DIR / "distillation_log.json", "w") as f:
+    with open(log_path, "w") as f:
         json.dump(results_log, f, indent=2)
 
     print("\nDone.")
