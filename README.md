@@ -55,7 +55,7 @@ Output: `results/delta_wers.json`, `results/baseline_wers.json`
 Sweep k=1 to k=14 layers removed, always taking the k least important by ΔWER:
 
 ```bash
-uv run python compute_layer_metrics.py --phase 3
+uv run python compute_layer_metrics.py --phase 2
 ```
 
 Output: `results/prune_sweep_delta_wer.json`
