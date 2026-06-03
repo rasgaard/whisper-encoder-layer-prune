@@ -35,9 +35,8 @@ RESULTS_DIR.mkdir(exist_ok=True)
 LANGUAGES = {
     "da_dk": "danish",
     "en_us": "english",
-    "it_it": "italian",
     "de_de": "german",
-    "sv_se": "swedish",
+    "fr_fr": "french",
 }
 
 

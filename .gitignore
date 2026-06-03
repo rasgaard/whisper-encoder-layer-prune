@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-logs/
-results/delta_wers_partial.json
-results/distilled_pruned_model*/
 .venv/
+logs/
+tmp/
+results/distilled_pruned_model*/

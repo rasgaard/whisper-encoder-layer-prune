@@ -47,9 +47,8 @@ LAYERS_TO_REMOVE = [5, 6, 7, 9, 10, 11]  # default: 6 least important by mean Δ
 LANGUAGES = {
     "da_dk": "danish",
     "en_us": "english",
-    "it_it": "italian",
     "de_de": "german",
-    "sv_se": "swedish",
+    "fr_fr": "french",
 }
 
 EVAL_BATCH_SIZE = 16  # for WER evaluation
