@@ -13,7 +13,6 @@ The pruned and distilled model is available on Hugging Face: [rasgaard/whisper-l
 ├── distill_pruned_encoder.py       # Label-free MSE distillation
 ├── paper_figures.ipynb             # Interactive notebook for all paper figures
 ├── scripts/
-│   ├── make_paper_figures.py       # Script version of paper figures
 │   ├── k7_zero_shot_sweep.py       # k=7 layer sensitivity analysis
 │   └── k6_random_baseline_sweep.py # Random layer selection baseline
 └── results/
@@ -94,16 +93,16 @@ Output: `results/k6_random_baseline_sweep.json`
 
 ### Step 6 — Paper figures
 
-Interactively via the notebook:
+Interactively:
 
 ```bash
 uv run jupyter lab paper_figures.ipynb
 ```
 
-Or non-interactively:
+Non-interactively from the terminal:
 
 ```bash
-uv run python scripts/make_paper_figures.py
+uv run jupyter nbconvert --to notebook --execute --inplace paper_figures.ipynb
 ```
 
 Output: `results/paper/`
