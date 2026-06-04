@@ -27,12 +27,6 @@ from datasets import load_dataset
 from jiwer import wer as compute_wer
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
-try:
-    from peft import LoraConfig, get_peft_model
-    _PEFT_AVAILABLE = True
-except ImportError:
-    _PEFT_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -42,7 +36,7 @@ MODEL_ID   = "openai/whisper-large-v3-turbo"
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-LAYERS_TO_REMOVE = [5, 6, 7, 9, 10, 11]  # default: 6 least important by mean ΔWER
+LAYERS_TO_REMOVE = [5, 6, 7, 9, 11, 12]  # default: 6 least important by mean ΔWER
 
 LANGUAGES = {
     "da_dk": "danish",
@@ -112,9 +106,7 @@ def parse_args():
     p.add_argument("--seed",       type=int,   default=42)
     p.add_argument("--device",     type=str,   default=None,  help="Device (e.g. cuda:1). Defaults to cuda if available.")
     p.add_argument("--layers",     type=int,   nargs="+",     default=None,
-                   help="Encoder layer indices to remove (default: 5 6 7 9 10 11)")
-    p.add_argument("--lora",       type=int,   default=None,  metavar="RANK",
-                   help="Use LoRA with given rank instead of full fine-tuning (e.g. --lora 16)")
+                   help="Encoder layer indices to remove (default: 5 6 7 9 11 12)")
     return p.parse_args()
 
 
@@ -128,15 +120,12 @@ def main():
         DEVICE = args.device
 
     layers_to_remove = sorted(args.layers) if args.layers is not None else LAYERS_TO_REMOVE
-    tag = "_".join(str(l) for l in layers_to_remove)
-    if args.lora:
-        tag += f"_lora{args.lora}"
-    log_path    = RESULTS_DIR / f"distillation_log_{tag}.json"
-    output_dir  = RESULTS_DIR / f"distilled_pruned_model_{tag}"
+    tag        = "_".join(str(l) for l in layers_to_remove)
+    log_path   = RESULTS_DIR / f"distillation_log_{tag}.json"
+    output_dir = RESULTS_DIR / f"distilled_pruned_model_{tag}"
 
     print(f"Device: {DEVICE}")
     print(f"Layers to remove: {layers_to_remove}")
-    print(f"LoRA rank: {args.lora if args.lora else 'disabled (full fine-tuning)'}")
     print(f"Steps: {args.steps}  LR: {args.lr}  Batch: {args.batch_size}\n")
 
     # --- load models ---
@@ -153,27 +142,12 @@ def main():
     teacher = teacher.to(DEVICE).eval()
     student = student.to(DEVICE)
 
-    if args.lora:
-        if not _PEFT_AVAILABLE:
-            raise ImportError("peft is required for --lora. Run: uv add peft")
-        for p in student.parameters():
-            p.requires_grad_(False)
-        lora_cfg = LoraConfig(
-            r=args.lora,
-            lora_alpha=args.lora * 2,
-            target_modules=["q_proj", "v_proj"],
-            layers_to_transform=list(range(len(student.model.encoder.layers))),
-        )
-        student = get_peft_model(student, lora_cfg)
-        encoder_fn = lambda x: student.base_model.model.model.encoder(x).last_hidden_state
-        trainable_params = [p for p in student.parameters() if p.requires_grad]
-    else:
-        for p in student.model.encoder.parameters():
-            p.requires_grad_(True)
-        for p in student.model.decoder.parameters():
-            p.requires_grad_(False)
-        encoder_fn = lambda x: student.model.encoder(x).last_hidden_state
-        trainable_params = list(student.model.encoder.parameters())
+    for p in student.model.encoder.parameters():
+        p.requires_grad_(True)
+    for p in student.model.decoder.parameters():
+        p.requires_grad_(False)
+    encoder_fn = lambda x: student.model.encoder(x).last_hidden_state
+    trainable_params = list(student.model.encoder.parameters())
 
     student.train()
     n_params = sum(p.numel() for p in trainable_params)
